@@ -102,6 +102,10 @@ type ATCCommand struct {
 
 	SessionSigningKey FileFlag `long:"session-signing-key" description:"File containing an RSA private key, used to sign session tokens."`
 
+	ExternalSSOURL       URLFlag `long:"external-sso-url" description:"URL endpoint that a set of RSA public keys, used to verify signed session tokens."`
+	ExternalClientID     string  `long:"external-sso-client-id" description:"If set, required to be present in 'aud' claim."`
+	ExternalClientSecret string  `long:"external-sso-client-secret" description:"If set, used for web flow."`
+
 	ResourceCheckingInterval          time.Duration `long:"resource-checking-interval" default:"1m" description:"Interval on which to check for new versions of resources."`
 	OldResourceGracePeriod            time.Duration `long:"old-resource-grace-period" default:"5m" description:"How long to cache the result of a get step after a newer version of the resource is found."`
 	ResourceCacheCleanupInterval      time.Duration `long:"resource-cache-cleanup-interval" default:"30s" description:"Interval on which to cleanup old caches of resources."`
@@ -338,6 +342,11 @@ func (cmd *ATCCommand) Runner(args []string) (ifrit.Runner, error) {
 		return nil, err
 	}
 
+	masterJwtValidator, err := cmd.loadExternalTokenProvider(signingKey, teamFactory)
+	if err != nil {
+		return nil, err
+	}
+
 	_, err = teamFactory.CreateDefaultTeamIfNotExists()
 	if err != nil {
 		return nil, err
@@ -371,6 +380,8 @@ func (cmd *ATCCommand) Runner(args []string) (ifrit.Runner, error) {
 		dbBuildFactory,
 		providerFactory,
 		signingKey,
+		masterJwtValidator,
+		masterJwtValidator,
 		engine,
 		workerClient,
 		drain,
@@ -805,6 +816,19 @@ func (cmd *ATCCommand) constructWorkerPool(
 	)
 }
 
+func (cmd *ATCCommand) loadExternalTokenProvider(internalSigningKey *rsa.PrivateKey, tf db.TeamFactory) (auth.ValidatingUserContextReader, error) {
+	fallback := &auth.JWTValidator{
+		PublicKey: &internalSigningKey.PublicKey,
+	}
+	// If no URL set, ignored
+	if cmd.ExternalSSOURL.String() == "" {
+		return fallback, nil
+	}
+
+	// URL is set
+	return auth.NewExternalJWTValidator(cmd.ExternalSSOURL.String(), cmd.ExternalClientID, cmd.ExternalClientSecret, fallback, tf)
+}
+
 func (cmd *ATCCommand) loadOrGenerateSigningKey() (*rsa.PrivateKey, error) {
 	var signingKey *rsa.PrivateKey
 
@@ -941,6 +965,8 @@ func (cmd *ATCCommand) constructAPIHandler(
 	dbBuildFactory db.BuildFactory,
 	providerFactory auth.OAuthFactory,
 	signingKey *rsa.PrivateKey,
+	authValidator auth.Validator,
+	ucr auth.UserContextReader,
 	engine engine.Engine,
 	workerClient worker.Client,
 	drain <-chan struct{},
@@ -948,10 +974,6 @@ func (cmd *ATCCommand) constructAPIHandler(
 	radarScannerFactory radar.ScannerFactory,
 	variablesFactory creds.VariablesFactory,
 ) (http.Handler, error) {
-	authValidator := auth.JWTValidator{
-		PublicKey: &signingKey.PublicKey,
-	}
-
 	getTokenValidator := auth.NewGetTokenValidator(teamFactory)
 
 	checkPipelineAccessHandlerFactory := auth.NewCheckPipelineAccessHandlerFactory(
@@ -969,7 +991,7 @@ func (cmd *ATCCommand) constructAPIHandler(
 		wrappa.NewAPIAuthWrappa(
 			authValidator,
 			getTokenValidator,
-			auth.JWTReader{PublicKey: &signingKey.PublicKey},
+			ucr,
 			checkPipelineAccessHandlerFactory,
 			checkBuildReadAccessHandlerFactory,
 			checkBuildWriteAccessHandlerFactory,

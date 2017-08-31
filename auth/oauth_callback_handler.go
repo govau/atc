@@ -140,30 +140,6 @@ func (handler *OAuthCallbackHandler) ServeHTTP(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	ctx := context.WithValue(oauth2.NoContext, oauth2.HTTPClient, preTokenClient)
-
-	token, err := provider.Exchange(ctx, r.FormValue("code"))
-	if err != nil {
-		hLog.Error("failed-to-exchange-token", err)
-		http.Error(w, "failed to exchange token", http.StatusInternalServerError)
-		return
-	}
-
-	httpClient := provider.Client(ctx, token)
-
-	verified, err := provider.Verify(hLog.Session("verify"), httpClient)
-	if err != nil {
-		hLog.Error("failed-to-verify-token", err)
-		http.Error(w, "failed to verify token", http.StatusInternalServerError)
-		return
-	}
-
-	if !verified {
-		hLog.Info("verification-failed")
-		http.Error(w, "verification failed", http.StatusUnauthorized)
-		return
-	}
-
 	exp := time.Now().Add(handler.expire)
 
 	csrfToken, err := handler.csrfTokenGenerator.GenerateToken()
@@ -173,14 +149,51 @@ func (handler *OAuthCallbackHandler) ServeHTTP(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	tokenType, signedToken, err := handler.authTokenGenerator.GenerateToken(exp, team.Name(), team.Admin(), csrfToken)
+	ctx := context.WithValue(oauth2.NoContext, oauth2.HTTPClient, preTokenClient)
+
+	// Add CSRF token to context, as some providers can use this to mint tokens directly
+	ctx = context.WithValue(ctx, csrfTokenClaimKey, csrfToken)
+
+	token, err := provider.Exchange(ctx, r.FormValue("code"))
 	if err != nil {
-		hLog.Error("failed-to-sign-token", err)
-		http.Error(w, "failed to generate auth token", http.StatusInternalServerError)
+		hLog.Error("failed-to-exchange-token", err)
+		http.Error(w, "failed to exchange token", http.StatusInternalServerError)
 		return
 	}
 
-	tokenStr := string(tokenType) + " " + string(signedToken)
+	var tokenStr string
+
+	// Has our external provider signed it for us?
+	if token != nil && strings.EqualFold(token.TokenType, TokenTypeExternal) {
+		// If, short-circuit normal processing, we don't need to verify here,
+		// as the token is already minted.
+		tokenStr = fmt.Sprintf("%s %s", token.TokenType, token.AccessToken)
+	} else {
+		// Normal flow
+		httpClient := provider.Client(ctx, token)
+
+		verified, err := provider.Verify(hLog.Session("verify"), httpClient)
+		if err != nil {
+			hLog.Error("failed-to-verify-token", err)
+			http.Error(w, "failed to verify token", http.StatusInternalServerError)
+			return
+		}
+
+		if !verified {
+			hLog.Info("verification-failed")
+			http.Error(w, "verification failed", http.StatusUnauthorized)
+			return
+		}
+
+		tokenType, signedToken, err := handler.authTokenGenerator.GenerateToken(exp, team.Name(), team.Admin(), csrfToken)
+		if err != nil {
+			hLog.Error("failed-to-sign-token", err)
+			http.Error(w, "failed to generate auth token", http.StatusInternalServerError)
+			return
+		}
+
+		tokenStr = string(tokenType) + " " + string(signedToken)
+	}
 
 	authCookie := &http.Cookie{
 		Name:     AuthCookieName,

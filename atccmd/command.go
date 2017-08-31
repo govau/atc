@@ -13,6 +13,7 @@ import (
 	_ "net/http/pprof"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"code.cloudfoundry.org/clock"
@@ -101,6 +102,11 @@ type ATCCommand struct {
 	DebugBindPort uint16 `long:"debug-bind-port" default:"8079"      description:"Port on which to listen for the pprof debugger endpoints."`
 
 	SessionSigningKey FileFlag `long:"session-signing-key" description:"File containing an RSA private key, used to sign session tokens."`
+
+	ExternalJWTCertsURL      URLFlag `long:"external-jwt-certificates-url"  description:"URL endpoint implements a protocol for serving public keys, used to verify signed session tokens."`
+	ExternalJWTAudienceClaim string  `long:"external-jwt-required-audience" description:"If set, only accept JWTs from signed by keys at the cert URL if they have an 'aud' claim that matches this."`
+
+	AutoCreateTeams bool `long:"auto-create-teams-based-on-jwt" description:"If set, auto-create team if token is signed for it."`
 
 	ResourceCheckingInterval          time.Duration `long:"resource-checking-interval" default:"1m" description:"Interval on which to check for new versions of resources."`
 	OldResourceGracePeriod            time.Duration `long:"old-resource-grace-period" default:"5m" description:"How long to cache the result of a get step after a newer version of the resource is found."`
@@ -338,6 +344,47 @@ func (cmd *ATCCommand) Runner(args []string) (ifrit.Runner, error) {
 		return nil, err
 	}
 
+	// Create mapping so that if we see a "Bearer" token, then we verify it
+	// with the token signing key above
+	jwtKeySource := &auth.TokenTypeKeySource{
+		Sources: map[string]auth.VerificationKeySource{
+			strings.ToLower(auth.TokenTypeBearer): &auth.StaticKeySource{
+				PublicKey: &signingKey.PublicKey,
+			},
+		},
+	}
+
+	// Add additional external token providers
+	cmd.loadExternalTokenProviders(jwtKeySource)
+
+	// Provide the key source to a JWT validator
+	var jwtValidator auth.ValidatingUserContextReader
+	jwtValidator = &auth.JWTValidator{
+		PublicKeySource: jwtKeySource,
+	}
+
+	// If we set flag to auto-create teams when we see a signed JWT,
+	// then wrap the validator above with one that has this side-effect.
+	if cmd.AutoCreateTeams {
+		jwtValidator = &auth.AutomaticTeamCreationWrapper{
+			Validator:   jwtValidator,
+			TeamFactory: teamFactory,
+			TeamCreator: func(teamName string) (*atc.Team, error) {
+				// Use the same authentication that is configured for the main team
+				// Note, that this is designed to work well with the "--external-auth-" provider options.
+				basicAuth, authConfig, err := cmd.prepareDefaultAuthenticationForTeam()
+				if err != nil {
+					return nil, err
+				}
+				return &atc.Team{
+					Name:      teamName,
+					BasicAuth: basicAuth,
+					Auth:      authConfig,
+				}, nil
+			},
+		}
+	}
+
 	_, err = teamFactory.CreateDefaultTeamIfNotExists()
 	if err != nil {
 		return nil, err
@@ -371,6 +418,8 @@ func (cmd *ATCCommand) Runner(args []string) (ifrit.Runner, error) {
 		dbBuildFactory,
 		providerFactory,
 		signingKey,
+		jwtValidator,
+		jwtValidator,
 		engine,
 		workerClient,
 		drain,
@@ -805,6 +854,25 @@ func (cmd *ATCCommand) constructWorkerPool(
 	)
 }
 
+func (cmd *ATCCommand) loadExternalTokenProviders(keySourceMap *auth.TokenTypeKeySource) {
+	// If no URL set, ignore
+	url := cmd.ExternalJWTCertsURL.String()
+	if url == "" {
+		return
+	}
+
+	// Add the external type ExternalJWTAudienceClaim
+	keySourceMap.Sources[strings.ToLower(auth.TokenTypeExternal)] = &auth.ExternalCertificateBasedKeySource{
+		CertificateSource: &auth.ExternalURLCertificateSource{
+			URL: url,
+		},
+		// If this is empty, no validation will take place, however it is recommended to set this,
+		// and is designed for use where multiple Concourse ATC instances share the same external
+		// auth provider.
+		Audience: cmd.ExternalJWTAudienceClaim,
+	}
+}
+
 func (cmd *ATCCommand) loadOrGenerateSigningKey() (*rsa.PrivateKey, error) {
 	var signingKey *rsa.PrivateKey
 
@@ -830,6 +898,29 @@ func (cmd *ATCCommand) loadOrGenerateSigningKey() (*rsa.PrivateKey, error) {
 	return signingKey, nil
 }
 
+func (cmd *ATCCommand) prepareDefaultAuthenticationForTeam() (*atc.BasicAuth, map[string]*json.RawMessage, error) {
+	var basicAuth *atc.BasicAuth
+	if cmd.Authentication.BasicAuth.IsConfigured() {
+		basicAuth = &atc.BasicAuth{
+			BasicAuthUsername: cmd.Authentication.BasicAuth.Username,
+			BasicAuthPassword: cmd.Authentication.BasicAuth.Password,
+		}
+	}
+
+	teamAuth := make(map[string]*json.RawMessage)
+	for name, config := range cmd.ProviderAuth {
+		if config.IsConfigured() {
+			data, err := json.Marshal(config)
+			if err != nil {
+				return nil, nil, err
+			}
+
+			teamAuth[name] = (*json.RawMessage)(&data)
+		}
+	}
+	return basicAuth, teamAuth, nil
+}
+
 func (cmd *ATCCommand) configureAuthForDefaultTeam(teamFactory db.TeamFactory) error {
 	team, found, err := teamFactory.FindTeam(atc.DefaultTeamName)
 	if err != nil {
@@ -840,29 +931,14 @@ func (cmd *ATCCommand) configureAuthForDefaultTeam(teamFactory db.TeamFactory) e
 		return errors.New("default team not found")
 	}
 
-	var basicAuth *atc.BasicAuth
-	if cmd.Authentication.BasicAuth.IsConfigured() {
-		basicAuth = &atc.BasicAuth{
-			BasicAuthUsername: cmd.Authentication.BasicAuth.Username,
-			BasicAuthPassword: cmd.Authentication.BasicAuth.Password,
-		}
+	basicAuth, teamAuth, err := cmd.prepareDefaultAuthenticationForTeam()
+	if err != nil {
+		return err
 	}
 
 	err = team.UpdateBasicAuth(basicAuth)
 	if err != nil {
 		return err
-	}
-
-	teamAuth := make(map[string]*json.RawMessage)
-	for name, config := range cmd.ProviderAuth {
-		if config.IsConfigured() {
-			data, err := json.Marshal(config)
-			if err != nil {
-				return err
-			}
-
-			teamAuth[name] = (*json.RawMessage)(&data)
-		}
 	}
 
 	err = team.UpdateProviderAuth(teamAuth)
@@ -941,6 +1017,8 @@ func (cmd *ATCCommand) constructAPIHandler(
 	dbBuildFactory db.BuildFactory,
 	providerFactory auth.OAuthFactory,
 	signingKey *rsa.PrivateKey,
+	authValidator auth.Validator,
+	ucr auth.UserContextReader,
 	engine engine.Engine,
 	workerClient worker.Client,
 	drain <-chan struct{},
@@ -948,10 +1026,6 @@ func (cmd *ATCCommand) constructAPIHandler(
 	radarScannerFactory radar.ScannerFactory,
 	variablesFactory creds.VariablesFactory,
 ) (http.Handler, error) {
-	authValidator := auth.JWTValidator{
-		PublicKey: &signingKey.PublicKey,
-	}
-
 	getTokenValidator := auth.NewGetTokenValidator(teamFactory)
 
 	checkPipelineAccessHandlerFactory := auth.NewCheckPipelineAccessHandlerFactory(
@@ -969,7 +1043,7 @@ func (cmd *ATCCommand) constructAPIHandler(
 		wrappa.NewAPIAuthWrappa(
 			authValidator,
 			getTokenValidator,
-			auth.JWTReader{PublicKey: &signingKey.PublicKey},
+			ucr,
 			checkPipelineAccessHandlerFactory,
 			checkBuildReadAccessHandlerFactory,
 			checkBuildWriteAccessHandlerFactory,

@@ -13,6 +13,8 @@ type TokenType string
 type TokenValue string
 
 const TokenTypeBearer = "Bearer"
+const TokenTypeExternal = "External"
+
 const expClaimKey = "exp"
 const teamNameClaimKey = "teamName"
 const isAdminClaimKey = "isAdmin"

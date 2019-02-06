@@ -8,7 +8,6 @@ import (
 	"sync"
 
 	"code.cloudfoundry.org/credhub-cli/credhub"
-	"code.cloudfoundry.org/credhub-cli/credhub/auth"
 	"code.cloudfoundry.org/lager"
 	"github.com/concourse/atc/creds"
 )
@@ -73,7 +72,7 @@ func (manager *CredHubManager) Init(log lager.Logger) error {
 	}
 
 	if manager.UAA.ClientId != "" && manager.UAA.ClientSecret != "" {
-		options = append(options, credhub.Auth(auth.UaaClientCredentials(
+		options = append(options, credhub.Auth(UAAAuthBuilder(
 			manager.UAA.ClientId,
 			manager.UAA.ClientSecret,
 		)))
